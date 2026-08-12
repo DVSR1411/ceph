@@ -1,0 +1,27 @@
+# Exposes the RGW (S3) endpoint via a LoadBalancer Service.
+# Same caveat as the dashboard one: needs MetalLB (or equivalent) on bare
+# metal, or works out of the box on vCluster's Docker driver.
+#
+# The ClusterIP service created automatically by the chart is named
+# rook-ceph-rgw-rgw-store (matches cephObjectStores[].name = "rgw-store"
+# in 02-cluster-values.yaml). This adds an external LB pointing at the
+# same pods.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rook-ceph-rgw-lb
+  namespace: rook-ceph
+  labels:
+    app: rook-ceph-rgw
+    rook_object_store: rgw-store
+spec:
+  type: LoadBalancer
+  ports:
+    - name: rgw
+      port: 80
+      targetPort: 80
+      protocol: TCP
+  selector:
+    app: rook-ceph-rgw
+    rook_object_store: rgw-store

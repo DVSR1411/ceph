@@ -1,0 +1,21 @@
+# vcluster.yaml (or merge into your existing vcluster config)
+#
+# IMPORTANT: run 05-setup-loop-devices.sh on the Docker HOST first, then
+# check `losetup -a` to see which /dev/loopX got assigned to each node's
+# backing file, and replace loop10/loop11/loop12 below with the real ones.
+
+experimental:
+  docker:
+    nodes:
+      - name: "worker-1"
+        args:
+          - "--privileged"
+          - "--device=/dev/loop10:/dev/loop10"
+      - name: "worker-2"
+        args:
+          - "--privileged"
+          - "--device=/dev/loop11:/dev/loop11"
+      - name: "worker-3"
+        args:
+          - "--privileged"
+          - "--device=/dev/loop12:/dev/loop12"

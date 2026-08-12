@@ -1,0 +1,30 @@
+# Exposes the Ceph Dashboard (UI) via a LoadBalancer Service instead of Ingress.
+#
+# NOTE: on bare metal, type: LoadBalancer only gets an external IP if you
+# have something providing that (e.g. MetalLB) - cloud providers do this
+# automatically, bare metal doesn't by default. If you're running this on
+# vCluster's Docker driver (vind), it has built-in LoadBalancer support, so
+# this should Just Work there.
+#
+# This creates a SEPARATE service pointing at the same dashboard pods that
+# rook-ceph-mgr-dashboard (ClusterIP, created automatically by the chart)
+# already targets - so it doesn't touch/replace that one.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: rook-ceph-dashboard-lb
+  namespace: rook-ceph
+  labels:
+    app: rook-ceph-mgr
+    rook_cluster: rook-ceph
+spec:
+  type: LoadBalancer
+  ports:
+    - name: dashboard
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+  selector:
+    app: rook-ceph-mgr
+    rook_cluster: rook-ceph
