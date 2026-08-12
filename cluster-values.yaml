@@ -60,28 +60,6 @@ cephClusterSpec:
         devices:
           - name: "/dev/nbd2"
 
-  # ---- Storage: PVC-based (Option B) ----
-  # If you'd rather let Rook provision OSDs as PVCs against a StorageClass
-  # (cleaner in cloud/k8s environments with dynamic block storage), comment
-  # out the `storage:` block above and uncomment this instead:
-  #
-  # storage:
-  #   storageClassDeviceSets:
-  #     - name: osd-set
-  #       count: 3
-  #       portable: false
-  #       volumeClaimTemplates:
-  #         - metadata:
-  #             name: data
-  #           spec:
-  #             resources:
-  #               requests:
-  #                 storage: 100Gi          # <- hard cap per OSD, set deliberately
-  #             storageClassName: "your-block-storage-class"
-  #             volumeMode: Block
-  #             accessModes:
-  #               - ReadWriteOnce
-
   resources:
     mgr:
       limits: {cpu: "1000m", memory: "1Gi"}
@@ -93,7 +71,7 @@ cephClusterSpec:
       limits: {cpu: "2000m", memory: "4Gi"}
       requests: {cpu: "500m", memory: "2Gi"}
 
-# Don't create CephFS or a general-purpose CephBlockPool - RGW only.
+# No need to create CephFS or CephBlockPool - RGW only.
 cephFileSystems: []
 cephBlockPools: []
 
@@ -112,9 +90,9 @@ cephObjectStores:
       preservePoolsOnDelete: false
       gateway:
         port: 80
-        instances: 1        # bump to 2+ for HA once you have enough nodes
+        instances: 1
         resources:
           limits: {cpu: "1000m", memory: "1Gi"}
           requests: {cpu: "250m", memory: "256Mi"}
     storageClass:
-      enabled: false        # we're not consuming buckets via k8s StorageClass/COSI here
+      enabled: false
