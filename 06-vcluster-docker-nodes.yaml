@@ -1,21 +1,33 @@
 # vcluster.yaml (or merge into your existing vcluster config)
 #
-# IMPORTANT: run 05-setup-loop-devices.sh on the Docker HOST first, then
-# check `losetup -a` to see which /dev/loopX got assigned to each node's
-# backing file, and replace loop10/loop11/loop12 below with the real ones.
+# Confirmed via `losetup -a` on the host:
+#   worker-1 -> /dev/loop30 (backed by /var/lib/rook-loop-disks/worker-1.img)
+#   worker-2 -> /dev/loop31 (backed by /var/lib/rook-loop-disks/worker-2.img)
+#   worker-3 -> /dev/loop32 (backed by /var/lib/rook-loop-disks/worker-3.img)
+#
+# NOTE: loop device numbers are assigned by `losetup -f` (next free number)
+# and are NOT guaranteed to stay the same after a host reboot. If you
+# recreate the loop devices later, re-check `losetup -a` and update both
+# this file and 02-cluster-values.yaml if the numbers changed.
 
 experimental:
   docker:
     nodes:
       - name: "worker-1"
+        volumes:
+          - "/run/udev:/run/udev:ro"
         args:
           - "--privileged"
-          - "--device=/dev/loop10:/dev/loop10"
+          - "--device=/dev/loop30:/dev/loop30"
       - name: "worker-2"
+        volumes:
+          - "/run/udev:/run/udev:ro"
         args:
           - "--privileged"
-          - "--device=/dev/loop11:/dev/loop11"
+          - "--device=/dev/loop31:/dev/loop31"
       - name: "worker-3"
+        volumes:
+          - "/run/udev:/run/udev:ro"
         args:
           - "--privileged"
-          - "--device=/dev/loop12:/dev/loop12"
+          - "--device=/dev/loop32:/dev/loop32"
