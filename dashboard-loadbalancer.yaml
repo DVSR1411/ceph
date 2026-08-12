@@ -22,7 +22,7 @@ spec:
   type: LoadBalancer
   ports:
     - name: dashboard
-      port: 8443
+      port: 7000
       targetPort: 8443
       protocol: TCP
   selector:

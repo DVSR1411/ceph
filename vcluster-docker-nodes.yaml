@@ -1,0 +1,31 @@
+# vcluster.yaml (or merge into your existing vcluster config)
+#
+# NBD devices connected via qemu-nbd on the host (11-setup-nbd-devices.sh):
+#   worker-1 -> /dev/nbd0 (backed by /var/lib/rook-loop-disks/worker-1.img)
+#   worker-2 -> /dev/nbd1 (backed by /var/lib/rook-loop-disks/worker-2.img)
+#   worker-3 -> /dev/nbd2 (backed by /var/lib/rook-loop-disks/worker-3.img)
+#
+# NBD devices appear as TYPE=disk to lsblk — Rook accepts them.
+# Re-run 11-setup-nbd-devices.sh after a host reboot.
+
+experimental:
+  docker:
+    nodes:
+      - name: "worker-1"
+        volumes:
+          - "/run/udev:/run/udev:ro"
+        args:
+          - "--privileged"
+          - "--device=/dev/nbd0:/dev/nbd0"
+      - name: "worker-2"
+        volumes:
+          - "/run/udev:/run/udev:ro"
+        args:
+          - "--privileged"
+          - "--device=/dev/nbd1:/dev/nbd1"
+      - name: "worker-3"
+        volumes:
+          - "/run/udev:/run/udev:ro"
+        args:
+          - "--privileged"
+          - "--device=/dev/nbd2:/dev/nbd2"

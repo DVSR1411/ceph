@@ -43,27 +43,22 @@ cephClusterSpec:
   # (vind). Each one needs a loop device passed through with --privileged
   # and --device (see 05-setup-loop-devices.sh and
   # 06-vcluster-docker-nodes.yaml). Confirmed via `losetup -a` on the host:
-  #   worker-1 -> /dev/loop30
-  #   worker-2 -> /dev/loop31
-  #   worker-3 -> /dev/loop32
-  #
-  # IMPORTANT: loop devices must be specified with the FULL PATH (/dev/loopN),
-  # not the bare name (loopN). Rook's default device discovery filters out
-  # TYPE=loop devices entirely - only the full-path form bypasses that filter.
-  # See: https://github.com/rook/rook/issues/11353
+  # NBD devices: image files connected via qemu-nbd on the host, injected
+  # into each node container as TYPE=disk (see 11-setup-nbd-devices.sh).
+  # Rook accepts TYPE=disk — this bypasses the loop/dm type filter.
   storage:
     useAllNodes: false
     useAllDevices: false
     nodes:
       - name: "worker-1"
         devices:
-          - name: "/dev/loop30"
+          - name: "/dev/nbd0"
       - name: "worker-2"
         devices:
-          - name: "/dev/loop31"
+          - name: "/dev/nbd1"
       - name: "worker-3"
         devices:
-          - name: "/dev/loop32"
+          - name: "/dev/nbd2"
 
   # ---- Storage: PVC-based (Option B) ----
   # If you'd rather let Rook provision OSDs as PVCs against a StorageClass
@@ -111,9 +106,8 @@ cephObjectStores:
           size: 2          # lower overhead than default 3; raise if you need more durability
         failureDomain: host
       dataPool:
-        erasureCoded:
-          dataChunks: 2
-          codingChunks: 1   # ~1.5x overhead instead of 3x with replication
+        replicated:
+          size: 2
         failureDomain: host
       preservePoolsOnDelete: false
       gateway:

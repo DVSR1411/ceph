@@ -1,108 +1,186 @@
 # Rook Ceph — RGW-only, with Dashboard UI
+## (vcluster / Docker driver — NBD disk passthrough)
 
 ## Prerequisites
-- A k8s cluster with at least 3 nodes that each have a **raw, unformatted
-  block device** attached (or a StorageClass that can dynamically provision
-  block volumes, if using the PVC option).
-- Helm 3 installed locally.
-- `kubectl` pointed at your cluster.
-
-Check available raw disks per node before writing the values file:
-```bash
-kubectl get nodes -o wide
-# then, on each node (e.g. via `kubectl debug node/<node> -it --image=busybox`)
-lsblk
-```
-Any disk that shows **no partitions / no filesystem** is a candidate for Ceph.
-
-### Special case: running inside vCluster's Docker driver (vind)
-If your 3 nodes are actually Docker containers created by vCluster's
-`experimental.docker` mode, there's no real disk attached to them by
-default — a bind-mounted directory (`volumes:`) is a filesystem, not a
-block device, and Ceph's OSDs (BlueStore) require raw block, not a
-directory. Do this first, on the Docker **host** machine:
-
-1. Run `05-setup-loop-devices.sh` (as root) to create sparse-file-backed
-   loop devices — one per node.
-2. Run `losetup -a` to see which `/dev/loopX` got assigned to each file.
-3. Update `06-vcluster-docker-nodes.yaml` with the real loop device names,
-   and apply it as part of your vcluster config (adds `--privileged` +
-   `--device` passthrough to each node container).
-4. Recreate/update your vcluster so the node containers pick up the new
-   device passthrough.
-5. Update `02-cluster-values.yaml`'s `storage.nodes[].devices[].name`
-   with the same loop device names.
-
-This is a **dev/testing pattern only** — loop devices are slower than
-real disks, don't survive a host reboot without re-running `losetup`,
-and the backing sparse files still consume real space on the host disk
-as data is written. Don't use this for anything you care about keeping.
+- Docker host with at least **60 GiB free disk** (3 × 20 GiB sparse images)
+- `vcluster` CLI, `helm 3`, `kubectl`, `qemu-utils` installed on the host
+- `nbd` kernel module loaded:
+  ```bash
+  sudo modprobe nbd max_part=8
+  # make it persist across reboots:
+  echo "nbd" | sudo tee /etc/modules-load.d/nbd.conf
+  ```
 
 ---
 
-## Step 1 — Add the Rook Helm repo
+## Quick start (fresh machine)
+
 ```bash
-helm repo add rook-release https://charts.rook.io/release
-helm repo update
+bash deploy.sh
 ```
 
-## Step 2 — Install the Rook operator
+`deploy.sh` handles everything: sanity checks, disk image creation, vcluster
+creation, NBD device setup, Rook operator + cluster install, CRUSH map fix,
+dashboard LoadBalancer, `.env` generation for `app.py`, and health check.
+It is idempotent — safe to re-run if something fails partway through.
+
+---
+
+## File reference
+
+| File | Purpose |
+|------|---------|
+| `vcluster-docker-nodes.yaml` | vcluster config — passes `/dev/nbdX` into each worker container with `--privileged` |
+| `setup-nbd-devices.sh` | Connects `.img` files to `/dev/nbd{0,1,2}` via `qemu-nbd` and injects device nodes into containers (called by `deploy.sh`) |
+| `operator-values.yaml` | Rook operator Helm values — CSI drivers disabled (RGW-only), minimal resources |
+| `cluster-values.yaml` | Ceph cluster Helm values — explicit node/device list, RGW store, dashboard |
+| `object-store-user.yaml` | Creates an S3 user; credentials land in a Secret |
+| `dashboard-loadbalancer.yaml` | LoadBalancer service for the Ceph dashboard (port 7000) |
+| `deploy.sh` | **Full deploy script** — runs all steps in order |
+
+---
+
+## What the deploy script does (step by step)
+
+### Step 0 — Sanity checks
+Verifies all required binaries are on `$PATH`: `vcluster`, `helm`, `kubectl`, `docker`, `qemu-nbd`.
+Also confirms the `nbd` kernel module is loaded — exits immediately if not.
+
+### Step 1 — Disk images
+Creates three 20 GiB sparse files under `/var/lib/rook-loop-disks/` (skipped if they already exist):
+```
+/var/lib/rook-loop-disks/worker-{1,2,3}.img
+```
+Thin-provisioned via `truncate` — only consume real space as data is written.
+Total raw capacity: 60 GiB → ~40 GiB usable (replication size 2).
+
+### Step 2 — vcluster
+If a vcluster named `test` already exists, reconnects to it (`vcluster connect test`).
+Otherwise creates it fresh:
 ```bash
-kubectl create namespace rook-ceph  # or let --create-namespace do it below
+vcluster create test -f vcluster-docker-nodes.yaml
+```
+Creates 3 worker node containers. Each gets `--privileged` and `--device=/dev/nbdX`
+so the NBD block device is visible inside.
+
+### Step 3 — NBD devices
+```bash
+sudo bash setup-nbd-devices.sh
+```
+Runs `qemu-nbd --connect=/dev/nbdX -f raw <image>` for each worker and injects
+the device nodes into the containers via `docker exec mknod`.
+NBD devices appear as `TYPE=disk` to `lsblk` — this is what makes Rook accept
+them (it rejects loop and dm devices by default).
+
+After `setup-nbd-devices.sh` returns, the script verifies each device by reading
+`/sys/block/nbdX/size` and exits with an error if any device reports size 0.
+
+> **After a host reboot:** the `.img` files survive but NBD connections don't.
+> Re-run `sudo bash setup-nbd-devices.sh` before anything else.
+
+### Step 4 — Rook operator
+Adds/updates the `rook-release` Helm repo, creates the `rook-ceph` namespace,
+then installs the operator (skipped if already installed):
+```bash
 helm install rook-ceph rook-release/rook-ceph \
-  --namespace rook-ceph --create-namespace \
-  -f 01-operator-values.yaml
-
-# watch it come up
-kubectl -n rook-ceph get pods -w
+  --namespace rook-ceph -f operator-values.yaml
 ```
-Wait until `rook-ceph-operator-...` is `Running`.
+RBD and CephFS CSI drivers are disabled — we only need RGW.
+Waits for `rook-ceph-operator` deployment rollout before continuing.
 
-## Step 3 — Edit the cluster values
-Open `02-cluster-values.yaml` and replace the placeholder node names
-(`worker-1`, `worker-2`, `worker-3`) and device names (`sdb`) with your
-real ones. This is the step that prevents Rook from claiming every disk
-on every node — do not skip it.
-
-## Step 4 — Install the Ceph cluster + RGW + Dashboard
+### Step 5 — Ceph cluster
+Installs the cluster chart (skipped if already installed):
 ```bash
 helm install rook-ceph-cluster rook-release/rook-ceph-cluster \
-  --namespace rook-ceph \
-  -f 02-cluster-values.yaml
-
-kubectl -n rook-ceph get pods -w
+  --namespace rook-ceph -f cluster-values.yaml
 ```
-This brings up: mons (3), mgr (1), OSDs (one per device you listed),
-the RGW gateway pod, and the mgr dashboard module.
+Brings up: 3 mons, 1 mgr, 3 OSDs (one per NBD device), 1 RGW gateway, and the mgr dashboard module.
 
-## Step 5 — Confirm cluster health
-Install the toolbox (handy for any `ceph` CLI commands):
+Waits for all mon pods to be `Ready` (up to 5 min), then polls until 3 OSD pods
+are `Running` (up to 5 min), exiting with an error if they don't come up in time.
+
+**Storage layout in `cluster-values.yaml`:**
+- `useAllNodes/useAllDevices: false` + explicit node list — only the named devices become OSDs
+- `metadataPool`: replicated `size: 2`
+- `dataPool`: replicated `size: 2` (not erasure-coded — EC needs more OSDs than the 3 we have to avoid `pg undersized` warnings)
+
+### Step 6 — CRUSH map fix + toolbox
+In vcluster's Docker driver all node containers share the host kernel, so
+Ceph's auto-discovery puts all 3 OSDs under the same host bucket (`worker-1`).
+With `failureDomain: host` this means replicas can't spread and PGs stay `undersized`.
+
+The script deploys the Rook toolbox and waits for it to be ready, then checks
+whether `worker-2` already exists in the CRUSH tree. If not, it spreads the OSDs:
 ```bash
-kubectl -n rook-ceph exec -it deploy/rook-ceph-tools -- ceph status
+ceph osd crush add-bucket worker-2 host
+ceph osd crush add-bucket worker-3 host
+ceph osd crush move worker-2 root=default
+ceph osd crush move worker-3 root=default
+ceph osd crush move osd.1 host=worker-2
+ceph osd crush move osd.2 host=worker-3
 ```
-If the toolbox isn't already deployed by the chart, apply:
-```bash
-kubectl apply -f https://raw.githubusercontent.com/rook/rook/master/deploy/examples/toolbox.yaml
-```
-You want to see `HEALTH_OK` (or `HEALTH_WARN` while OSDs are still settling).
+Also sets `.mgr` pool `min_size 1` so the mgr pool can go active with 3 OSDs.
 
-## Step 6 — Access the Dashboard (UI)
-Get the auto-generated admin password:
+After this the cluster reaches `HEALTH_OK`.
+
+### Step 7 — Dashboard LoadBalancer
+```bash
+kubectl apply -f dashboard-loadbalancer.yaml
+```
+Exposes the dashboard on port `7000` via vcluster's built-in LoadBalancer support.
+Polls until the service has an external IP assigned (up to 3 min).
+
+> **RGW is not exposed via LoadBalancer.** vcluster's VIP-mode LB IPs are only reachable within the Docker bridge network, not from the host. Access RGW from the host via port-forward instead (see below).
+
+### Step 7b — Write `.env`
+Reads the S3 credentials from the `rook-ceph-object-user-rgw-store-s3-user` secret
+and writes `.env` for `app.py`:
+```
+CEPH_RGW_HOST=localhost
+RGW_ACCESS_KEY=<from secret>
+RGW_SECRET_KEY=<from secret>
+RGW_REGION=us-east-1
+RGW_PORT=7480
+CEPH_BUCKET=test
+```
+Note: the S3 user secret is only present if `object-store-user.yaml` has been applied.
+If the secret doesn't exist yet, `ACCESS_KEY`/`SECRET_KEY` will be empty — apply
+the user manifest and re-run the script, or fill in `.env` manually.
+
+### Step 8 — Health check
+Polls `cephcluster.status.ceph.health` every 10 s for up to 3 min until `HEALTH_OK`.
+Prints the current health status on each iteration so you can see progress.
+
+---
+
+## Accessing the cluster
+
+### Dashboard
+```
+https://<dashboard-lb-ip>:7000  (user: admin)
+```
+Get the password:
 ```bash
 kubectl -n rook-ceph get secret rook-ceph-dashboard-password \
-  -o jsonpath="{['data']['password']}" | base64 -d ; echo
+  -o jsonpath="{['data']['password']}" | base64 -d; echo
 ```
-Quick access via port-forward:
+Get the IP:
 ```bash
-kubectl -n rook-ceph port-forward svc/rook-ceph-mgr-dashboard 8443:8443
-# then open https://localhost:8443  (user: admin, password: from above)
+kubectl -n rook-ceph get svc rook-ceph-dashboard-lb
 ```
-Or apply `03-dashboard-ingress.yaml` (edit the host first) for permanent
-external access through your ingress controller.
 
-## Step 7 — Create S3 credentials for RGW
+> The dashboard shows Prometheus warnings — expected, monitoring is disabled.
+
+### RGW S3 endpoint
+RGW is accessed from the host via `kubectl port-forward` (vcluster LB VIPs are not routable from the host):
 ```bash
-kubectl apply -f 04-object-store-user.yaml
+kubectl -n rook-ceph port-forward svc/rook-ceph-rgw-rgw-store 7480:80
+```
+Endpoint: `http://localhost:7480`
+
+### Create S3 credentials
+```bash
+kubectl apply -f object-store-user.yaml
 
 kubectl -n rook-ceph get secret rook-ceph-object-user-rgw-store-s3-user \
   -o jsonpath='{.data.AccessKey}' | base64 -d; echo
@@ -110,30 +188,57 @@ kubectl -n rook-ceph get secret rook-ceph-object-user-rgw-store-s3-user \
   -o jsonpath='{.data.SecretKey}' | base64 -d; echo
 ```
 
-## Step 8 — Get the RGW endpoint
+### Test S3
 ```bash
-kubectl -n rook-ceph get svc rook-ceph-rgw-rgw-store
-```
-In-cluster endpoint: `http://rook-ceph-rgw-rgw-store.rook-ceph.svc:80`
-Expose it externally the same way (Ingress, LoadBalancer Service, or
-NodePort) depending on your setup — not included here since it depends
-on your ingress/load balancer choice.
+# In a separate terminal:
+kubectl -n rook-ceph port-forward svc/rook-ceph-rgw-rgw-store 7480:80
 
-## Step 9 — Test it
-```bash
-# using aws-cli configured with the access/secret key from Step 7
-aws --endpoint-url http://<rgw-endpoint> s3 mb s3://test-bucket
-aws --endpoint-url http://<rgw-endpoint> s3 ls
+aws --endpoint-url http://localhost:7480 s3 mb s3://test-bucket
+aws --endpoint-url http://localhost:7480 s3 ls
 ```
 
 ---
 
-## Notes on space control (recap)
-- `storage.useAllNodes/useAllDevices: false` + explicit `nodes:` list —
-  only the disks you name become OSDs.
-- `dataPool` uses erasure coding (2+1) instead of 3x replication —
-  roughly 1.5x raw overhead instead of 3x.
-- `metadataPool` replication set to `size: 2` — small pool anyway, but
-  tunable.
-- If using the PVC option instead, `volumeClaimTemplates.resources.requests.storage`
-  is a hard per-OSD cap — total capacity = that value × `count`.
+## Teardown
+
+```bash
+helm uninstall rook-ceph-cluster -n rook-ceph
+helm uninstall rook-ceph -n rook-ceph
+
+# Strip finalizers so the namespace actually deletes
+kubectl -n rook-ceph patch cephcluster rook-ceph \
+  --type=merge -p '{"metadata":{"finalizers":[]}}'
+kubectl -n rook-ceph patch cephobjectstore rgw-store \
+  --type=merge -p '{"metadata":{"finalizers":[]}}'
+kubectl -n rook-ceph patch clientprofile rook-ceph \
+  --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+kubectl get namespace rook-ceph -o json \
+  | python3 -c "import json,sys; ns=json.load(sys.stdin); ns['spec']['finalizers']=[]; print(json.dumps(ns))" \
+  | kubectl replace --raw /api/v1/namespaces/rook-ceph/finalize -f -
+
+vcluster delete test
+
+# Disconnect NBD devices
+sudo qemu-nbd --disconnect /dev/nbd0
+sudo qemu-nbd --disconnect /dev/nbd1
+sudo qemu-nbd --disconnect /dev/nbd2
+```
+
+To also wipe the disk images (full reset):
+```bash
+sudo rm /var/lib/rook-loop-disks/worker-*.img
+```
+
+---
+
+## Known gotchas
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| OSD prepare jobs skip devices with "different ceph cluster" | Stale Ceph metadata on disk from a previous run | Delete and recreate the `.img` files, reconnect NBD |
+| All OSDs land on `worker-1` in CRUSH map | vind containers share host kernel — Ceph sees same hostname | Step 6 CRUSH fix in `deploy.sh` |
+| `pg undersized` / `HEALTH_WARN` after install | EC data pool created before CRUSH fix, or `size > OSD count` | `cluster-values.yaml` uses replicated `size: 2`; CRUSH fix spreads OSDs |
+| `qemu-nbd: Failed to set NBD socket` | Device already connected | Safe to ignore — check `cat /sys/block/nbdX/size` to confirm |
+| Namespace stuck `Terminating` | Rook finalizers on CephCluster / CephObjectStore / clientprofile | See teardown section above |
+| NBD devices gone after reboot | qemu-nbd connections don't persist | Re-run `sudo bash setup-nbd-devices.sh` |
+| Prometheus warnings in dashboard | Monitoring stack not deployed | Expected — ignore them |
