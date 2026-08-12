@@ -93,7 +93,7 @@ cephClusterSpec:
       limits: {cpu: "2000m", memory: "4Gi"}
       requests: {cpu: "500m", memory: "2Gi"}
 
-# Don't create CephFS or a general-purpose CephBlockPool - RGW only.
+# Don't create CephFS or a CephBlockPool - RGW only.
 cephFileSystems: []
 cephBlockPools: []
 
