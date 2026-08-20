@@ -173,7 +173,9 @@ done
 # 6. Fix CRUSH map + toolbox
 # ---------------------------------------------------------------------------
 echo "==> [6/8] Fixing CRUSH map..."
-kubectl apply -f https://raw.githubusercontent.com/rook/rook/master/deploy/examples/toolbox.yaml
+kubectl apply -f https://raw.githubusercontent.com/rook/rook/v1.20.5/deploy/examples/toolbox.yaml
+kubectl -n rook-ceph set image deployment/rook-ceph-tools \
+  rook-ceph-tools=quay.io/ceph/ceph:v20.2.4
 kubectl -n rook-ceph rollout status deploy/rook-ceph-tools --timeout=120s
 
 worker2_exists=$(kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
