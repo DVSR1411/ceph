@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Full Rook-Ceph RGW-only deployment on vcluster (docker/vind driver).
+# Full Rook-Ceph RGW-only deployment on kind (docker driver).
 # Run as normal user: bash deploy.sh (sudo is used only where root is needed)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Ensure kubectl/helm/vcluster use the invoking user's kubeconfig even if called via sudo
 export KUBECONFIG="${KUBECONFIG:-$HOME/.kube/config}"
-# If run under sudo, fall back to the original user's home
 if [ -n "${SUDO_USER:-}" ]; then
   export KUBECONFIG="/home/${SUDO_USER}/.kube/config"
 fi
@@ -17,7 +15,7 @@ fi
 # 0. Sanity checks
 # ---------------------------------------------------------------------------
 echo "==> [0/8] Sanity checks..."
-for cmd in vcluster helm kubectl docker qemu-nbd wipefs; do
+for cmd in kind helm kubectl docker qemu-nbd wipefs; do
   command -v "$cmd" &>/dev/null || { echo "ERROR: $cmd not found"; exit 1; }
 done
 
@@ -34,22 +32,22 @@ DIR="/var/lib/rook-loop-disks"
 sudo mkdir -p "$DIR"
 for NODE in worker-1 worker-2 worker-3; do
   FILE="$DIR/${NODE}.img"
-  # Always recreate — reusing old images risks stale bluestore metadata
   echo "    Creating $FILE (20G sparse)..."
   sudo rm -f "$FILE"
   sudo truncate -s 20G "$FILE"
 done
 
 # ---------------------------------------------------------------------------
-# 2. Start vcluster
+# 2. Start kind cluster
 # ---------------------------------------------------------------------------
-echo "==> [2/8] Starting vcluster 'test'..."
-if vcluster list 2>/dev/null | grep -q "test"; then
-  echo "    vcluster 'test' already exists, connecting..."
-  vcluster connect test
+echo "==> [2/8] Starting kind cluster 'rook-ceph'..."
+if kind get clusters 2>/dev/null | grep -q "^rook-ceph$"; then
+  echo "    kind cluster 'rook-ceph' already exists, skipping."
 else
-  vcluster create test -f vcluster-docker-nodes.yaml
+  kind create cluster --name rook-ceph --config kind-config.yaml
 fi
+
+kind export kubeconfig --name rook-ceph
 
 # Give node containers a moment to fully start
 sleep 5
@@ -79,7 +77,6 @@ done
 echo "    nbd0/1/2 all connected."
 
 # Wipe stale bluestore/filesystem metadata from previous runs
-# wipefs removes partition/fs signatures; dd zeros the bluestore superblock
 echo "    Wiping stale metadata from nbd devices..."
 for i in 0 1 2; do
   sudo wipefs -a /dev/nbd${i}
@@ -88,9 +85,11 @@ done
 echo "    Wipe done."
 
 # Inject correct device node into each container and remove all others (nbd0-15)
+# kind container names: rook-ceph-worker, rook-ceph-worker2, rook-ceph-worker3
 declare -A NODE_DEV=([worker-1]=0 [worker-2]=1 [worker-3]=2)
+declare -A NODE_CTR=([worker-1]="rook-ceph-worker" [worker-2]="rook-ceph-worker2" [worker-3]="rook-ceph-worker3")
 for NODE in worker-1 worker-2 worker-3; do
-  CTR="vcluster.node.test.${NODE}"
+  CTR="${NODE_CTR[$NODE]}"
   OWN="${NODE_DEV[$NODE]}"
 
   MAJ=$(printf '%d' "0x$(stat -c '%t' /dev/nbd${OWN})")
@@ -177,16 +176,15 @@ kubectl apply -f https://raw.githubusercontent.com/rook/rook/master/deploy/examp
 kubectl -n rook-ceph rollout status deploy/rook-ceph-tools --timeout=120s
 
 worker2_exists=$(kubectl -n rook-ceph exec deploy/rook-ceph-tools -- \
-  ceph osd tree 2>/dev/null | grep -c "worker-2" || true)
+  ceph osd tree 2>/dev/null | grep -c "rook-ceph-worker2" || true)
 
 if [ "$worker2_exists" -eq 0 ]; then
   echo "    Spreading OSDs across host buckets..."
   kubectl -n rook-ceph exec deploy/rook-ceph-tools -- bash -c '
-    ceph osd crush add-bucket worker-2 host
-    ceph osd crush add-bucket worker-3 host
-    ceph osd crush move worker-2 root=default
-    ceph osd crush move worker-3 root=default
-    # Dynamically find OSD IDs that are not osd.0 (which stays on worker-1)
+    ceph osd crush add-bucket rook-ceph-worker2 host
+    ceph osd crush add-bucket rook-ceph-worker3 host
+    ceph osd crush move rook-ceph-worker2 root=default
+    ceph osd crush move rook-ceph-worker3 root=default
     OSDS=$(ceph osd tree --format json | python3 -c "
 import json,sys
 t=json.load(sys.stdin)
@@ -195,7 +193,7 @@ print(\" \".join(ids))
 ")
     i=2
     for osd in $OSDS; do
-      ceph osd crush move osd.${osd} host=worker-${i}
+      ceph osd crush move osd.${osd} host=rook-ceph-worker${i}
       i=$((i+1))
     done
   '
@@ -206,24 +204,28 @@ fi
 # Set min_size 1 on all pools so they stay active with 3 OSDs at replication size 2
 kubectl -n rook-ceph exec deploy/rook-ceph-tools -- bash -c '
   for pool in $(ceph osd pool ls); do
+  # ceph osd pool set $pool size 1 --yes-i-really-mean-it 2>/dev/null || true
     ceph osd pool set $pool min_size 1 2>/dev/null || true
   done
+  # Remove stale CSI auth entities with insecure key types (created by disabled CSI drivers)
+  for entity in client.csi-cephfs-node.1 client.csi-cephfs-provisioner.1 client.csi-rbd-node.1 client.csi-rbd-provisioner.1; do
+    ceph auth del $entity 2>/dev/null || true
+  done
+  ceph config set mon auth_allow_insecure_global_id_reclaim false
+  ceph config set mon mon_auth_allow_insecure_key false
+  ceph health mute AUTH_INSECURE_KEYS_ALLOWED 2>/dev/null || true
+  ceph health mute AUTH_INSECURE_KEYS_CREATABLE 2>/dev/null || true
+  ceph health mute AUTH_INSECURE_CLIENT_KEY_TYPE 2>/dev/null || true
 '
 
 # ---------------------------------------------------------------------------
-# 7. Apply LoadBalancer + wait for IP
+# 7. Apply NodePort service + wait
 # ---------------------------------------------------------------------------
-echo "==> [7/8] Applying LoadBalancer services..."
+echo "==> [7/8] Applying dashboard NodePort service..."
 kubectl apply -f dashboard-loadbalancer.yaml
 
-echo "    Waiting for external IP (up to 3 min)..."
-dash_ip=""
-for i in $(seq 1 18); do
-  dash_ip=$(kubectl -n rook-ceph get svc rook-ceph-dashboard-lb \
-    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
-  [ -n "$dash_ip" ] && break
-  sleep 10
-done
+NODE_IP=$(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' \
+  -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "127.0.0.1")
 
 # ---------------------------------------------------------------------------
 # 7b. Write .env for app.py
@@ -260,15 +262,12 @@ done
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
-dash_ip=$(kubectl -n rook-ceph get svc rook-ceph-dashboard-lb \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "<pending>")
-
 echo ""
 echo "======================================================"
 echo " Ceph cluster is up!"
 echo "======================================================"
 echo ""
-echo "Dashboard: https://${dash_ip}:7000  (user: admin)"
+echo "Dashboard: https://${NODE_IP}:30700  (user: admin)"
 echo "Password:"
 kubectl -n rook-ceph get secret rook-ceph-dashboard-password \
   -o jsonpath="{['data']['password']}" | base64 -d; echo

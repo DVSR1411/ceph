@@ -39,24 +39,19 @@ cephClusterSpec:
   # Replace node names/devices with your real ones.
   # Run `kubectl get nodes` and check available disks with
   # `lsblk` on each node first.
-  # NOTE: these node containers are running via vcluster's docker driver
-  # (vind). Each one needs a loop device passed through with --privileged
-  # and --device (see 05-setup-loop-devices.sh and
-  # 06-vcluster-docker-nodes.yaml). Confirmed via `losetup -a` on the host:
-  # NBD devices: image files connected via qemu-nbd on the host, injected
-  # into each node container as TYPE=disk (see 11-setup-nbd-devices.sh).
-  # Rook accepts TYPE=disk — this bypasses the loop/dm type filter.
+  # kind nodes: .img files attached as NBD devices on the host (TYPE=disk,
+  # Rook accepts them) and device nodes injected into each worker container.
   storage:
     useAllNodes: false
     useAllDevices: false
     nodes:
-      - name: "worker-1"
+      - name: "rook-ceph-worker"
         devices:
           - name: "/dev/nbd0"
-      - name: "worker-2"
+      - name: "rook-ceph-worker2"
         devices:
           - name: "/dev/nbd1"
-      - name: "worker-3"
+      - name: "rook-ceph-worker3"
         devices:
           - name: "/dev/nbd2"
 
